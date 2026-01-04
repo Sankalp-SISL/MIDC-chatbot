@@ -13,7 +13,7 @@ from vertexai.generative_models import GenerativeModel
 BUCKET_NAME = "midc-chatbot-content"
 PROJECT_ID = os.environ.get("GOOGLE_CLOUD_PROJECT")
 LOCATION = "us-central1"
-MODEL_NAME = "gemini-1.5-flash"
+MODEL_NAME = "gemini-2.5-flash-001"
 
 # Initialize Vertex AI (uses Cloud Run service account automatically)
 vertexai.init(project=PROJECT_ID, location=LOCATION)
@@ -130,4 +130,5 @@ def health():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+
 
