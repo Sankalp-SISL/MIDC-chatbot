@@ -3,8 +3,8 @@ import json
 from flask import Flask, request, jsonify
 from google.cloud import storage
 
-import vertexai
-from vertexai.generative_models import GenerativeModel, GenerationConfig
+from google import genai
+from google.genai import types
 
 # --------------------
 # CONFIG
@@ -12,10 +12,14 @@ from vertexai.generative_models import GenerativeModel, GenerationConfig
 BUCKET_NAME = "midc-chatbot-content"
 PROJECT_ID = os.environ.get("GOOGLE_CLOUD_PROJECT")
 LOCATION = "us-central1"
-MODEL_NAME = "gemini-1.5-flash-001"
+MODEL_NAME = "gemini-2.0-flash-001"
 
-# Initialize Vertex AI
-vertexai.init(project=PROJECT_ID, location=LOCATION)
+# Initialize GenAI client for Vertex AI
+client = genai.Client(
+    vertexai=True,
+    project=PROJECT_ID,
+    location=LOCATION
+)
 
 app = Flask(__name__)
 
@@ -23,8 +27,8 @@ app = Flask(__name__)
 # HELPERS
 # --------------------
 def load_section(section: str):
-    client = storage.Client()
-    bucket = client.bucket(BUCKET_NAME)
+    client_gcs = storage.Client()
+    bucket = client_gcs.bucket(BUCKET_NAME)
     blob = bucket.blob(f"{section}/content.json")
     return json.loads(blob.download_as_text())
 
@@ -47,14 +51,6 @@ def detect_sections(query: str):
         sections.add("faq")
     if "investor" in q:
         sections.add("investors")
-    if "customer" in q:
-        sections.add("customers")
-    if "sector" in q:
-        sections.add("focus-sectors")
-    if "contact" in q:
-        sections.add("contact")
-    if "notice" in q:
-        sections.add("important-notice")
 
     if not sections:
         sections.update(["about-midc", "faq"])
@@ -104,30 +100,26 @@ QUESTION:
 {question}
 """
 
-        model = GenerativeModel(MODEL_NAME)
-
-        response = model.generate_content(
-            prompt,
-            generation_config=GenerationConfig(
-                temperature=0.2,
-                max_output_tokens=512
-            )
+        response = client.models.generate_content(
+            model=MODEL_NAME,
+            contents=[
+                types.Content(
+                    role="user",
+                    parts=[types.Part(text=prompt)]
+                )
+            ]
         )
 
-        # Guard against empty / blocked responses
-        if not response or not response.text:
-            return jsonify({
-                "answer": "The requested information is not available on MIDC's official website.",
-                "sources": sources
-            })
+        text = response.text if response and response.text else (
+            "The requested information is not available on MIDC's official website."
+        )
 
         return jsonify({
-            "answer": response.text,
+            "answer": text,
             "sources": sources
         })
 
     except Exception as e:
-        # Never crash the service
         print("[FATAL ERROR]", str(e))
         return jsonify({
             "error": "Internal processing error",
@@ -140,4 +132,3 @@ def health():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
-
