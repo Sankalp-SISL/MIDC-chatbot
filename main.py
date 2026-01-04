@@ -2,16 +2,21 @@ import os
 import json
 from flask import Flask, request, jsonify
 from google.cloud import storage
-import google.generativeai as genai
+
+# Vertex AI Gemini (CORRECT SDK for Cloud Run)
+import vertexai
+from vertexai.generative_models import GenerativeModel
 
 # --------------------
 # CONFIG
 # --------------------
 BUCKET_NAME = "midc-chatbot-content"
+PROJECT_ID = os.environ.get("GOOGLE_CLOUD_PROJECT")
+LOCATION = "asia-south1"
 MODEL_NAME = "gemini-1.5-flash"
 
-# Gemini via service account (no API key needed)
-genai.configure()  # uses default credentials in Cloud Run
+# Initialize Vertex AI (uses Cloud Run service account automatically)
+vertexai.init(project=PROJECT_ID, location=LOCATION)
 
 app = Flask(__name__)
 
@@ -29,7 +34,7 @@ def detect_sections(query: str):
     q = query.lower()
     sections = set()
 
-    # RTS / PDFs
+    # RTS / PDF-heavy queries
     if any(k in q for k in ["rts", "right to service", "act", "gazette"]):
         sections.update([
             "right-to-public-service-act",
@@ -37,7 +42,7 @@ def detect_sections(query: str):
             "list-of-services-under-rts-act"
         ])
 
-    # Common pages
+    # Common informational pages
     if any(k in q for k in ["vision", "mission"]):
         sections.add("about-midc")
     if "maharashtra" in q:
@@ -72,8 +77,8 @@ def build_context(sections):
             data = load_section(s)
             texts.extend(data.get("chunks", [])[:3])  # cap per section
             sources.append(data.get("source_url"))
-        except Exception:
-            continue
+        except Exception as e:
+            print(f"[WARN] Failed to load section {s}: {str(e)}")
 
     context = "\n\n".join(texts)
     return context, list(set(sources))
@@ -93,9 +98,10 @@ def chat():
     context, sources = build_context(sections)
 
     prompt = f"""
-You are an official information assistant for MIDC.
-Answer ONLY using the provided content.
-If the answer is not present, say:
+You are an official information assistant for MIDC (Maharashtra Industrial Development Corporation).
+
+Answer ONLY using the content provided below.
+If the answer is not present, respond exactly with:
 "The requested information is not available on MIDC's official website."
 
 CONTENT:
@@ -106,11 +112,11 @@ QUESTION:
 
 INSTRUCTIONS:
 - Be concise and factual
-- Do not infer or add external knowledge
+- Do NOT add assumptions or external knowledge
 - Cite sources at the end
 """
 
-    model = genai.GenerativeModel(MODEL_NAME)
+    model = GenerativeModel(MODEL_NAME)
     response = model.generate_content(prompt)
 
     return jsonify({
@@ -118,7 +124,7 @@ INSTRUCTIONS:
         "sources": sources
     })
 
-@app.route("/")
+@app.route("/", methods=["GET"])
 def health():
     return "MIDC Chatbot is running", 200
 
