@@ -3,9 +3,8 @@ import json
 from flask import Flask, request, jsonify
 from google.cloud import storage
 
-# Vertex AI Gemini (CORRECT SDK for Cloud Run)
 import vertexai
-from vertexai.generative_models import GenerativeModel
+from vertexai.generative_models import GenerativeModel, GenerationConfig
 
 # --------------------
 # CONFIG
@@ -15,7 +14,7 @@ PROJECT_ID = os.environ.get("GOOGLE_CLOUD_PROJECT")
 LOCATION = "us-central1"
 MODEL_NAME = "gemini-2.5-flash-001"
 
-# Initialize Vertex AI (uses Cloud Run service account automatically)
+# Initialize Vertex AI
 vertexai.init(project=PROJECT_ID, location=LOCATION)
 
 app = Flask(__name__)
@@ -27,14 +26,12 @@ def load_section(section: str):
     client = storage.Client()
     bucket = client.bucket(BUCKET_NAME)
     blob = bucket.blob(f"{section}/content.json")
-    data = json.loads(blob.download_as_text())
-    return data
+    return json.loads(blob.download_as_text())
 
 def detect_sections(query: str):
     q = query.lower()
     sections = set()
 
-    # RTS / PDF-heavy queries
     if any(k in q for k in ["rts", "right to service", "act", "gazette"]):
         sections.update([
             "right-to-public-service-act",
@@ -42,13 +39,10 @@ def detect_sections(query: str):
             "list-of-services-under-rts-act"
         ])
 
-    # Common informational pages
     if any(k in q for k in ["vision", "mission"]):
         sections.add("about-midc")
     if "maharashtra" in q:
         sections.add("about-maharashtra")
-    if any(k in q for k in ["department", "organisation", "organization", "structure"]):
-        sections.add("departments-of-midc")
     if "faq" in q:
         sections.add("faq")
     if "investor" in q:
@@ -62,7 +56,6 @@ def detect_sections(query: str):
     if "notice" in q:
         sections.add("important-notice")
 
-    # Safe fallback
     if not sections:
         sections.update(["about-midc", "faq"])
 
@@ -75,29 +68,29 @@ def build_context(sections):
     for s in sections:
         try:
             data = load_section(s)
-            texts.extend(data.get("chunks", [])[:3])  # cap per section
+            texts.extend(data.get("chunks", [])[:3])
             sources.append(data.get("source_url"))
         except Exception as e:
-            print(f"[WARN] Failed to load section {s}: {str(e)}")
+            print(f"[WARN] Failed loading {s}: {e}")
 
-    context = "\n\n".join(texts)
-    return context, list(set(sources))
+    return "\n\n".join(texts), list(set(sources))
 
 # --------------------
 # ROUTES
 # --------------------
 @app.route("/chat", methods=["POST"])
 def chat():
-    body = request.get_json(silent=True) or {}
-    question = body.get("question", "").strip()
+    try:
+        body = request.get_json(silent=True) or {}
+        question = body.get("question", "").strip()
 
-    if not question:
-        return jsonify({"error": "Question is required"}), 400
+        if not question:
+            return jsonify({"error": "Question is required"}), 400
 
-    sections = detect_sections(question)
-    context, sources = build_context(sections)
+        sections = detect_sections(question)
+        context, sources = build_context(sections)
 
-    prompt = f"""
+        prompt = f"""
 You are an official information assistant for MIDC (Maharashtra Industrial Development Corporation).
 
 Answer ONLY using the content provided below.
@@ -109,20 +102,37 @@ CONTENT:
 
 QUESTION:
 {question}
-
-INSTRUCTIONS:
-- Be concise and factual
-- Do NOT add assumptions or external knowledge
-- Cite sources at the end
 """
 
-    model = GenerativeModel(MODEL_NAME)
-    response = model.generate_content(prompt)
+        model = GenerativeModel(MODEL_NAME)
 
-    return jsonify({
-        "answer": response.text,
-        "sources": sources
-    })
+        response = model.generate_content(
+            prompt,
+            generation_config=GenerationConfig(
+                temperature=0.2,
+                max_output_tokens=512
+            )
+        )
+
+        # Guard against empty / blocked responses
+        if not response or not response.text:
+            return jsonify({
+                "answer": "The requested information is not available on MIDC's official website.",
+                "sources": sources
+            })
+
+        return jsonify({
+            "answer": response.text,
+            "sources": sources
+        })
+
+    except Exception as e:
+        # Never crash the service
+        print("[FATAL ERROR]", str(e))
+        return jsonify({
+            "error": "Internal processing error",
+            "details": str(e)
+        }), 500
 
 @app.route("/", methods=["GET"])
 def health():
@@ -130,5 +140,3 @@ def health():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
-
-
