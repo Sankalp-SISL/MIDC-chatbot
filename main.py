@@ -15,7 +15,7 @@ PROJECT_ID = os.environ.get("GOOGLE_CLOUD_PROJECT")
 LOCATION = "us-central1"
 MODEL_NAME = "gemini-2.0-flash-001"
 
-# Allowed content sections (authoritative list)
+# Authoritative list of sections
 ALLOWED_SECTIONS = [
     "about-midc",
     "about-maharashtra",
@@ -32,7 +32,7 @@ ALLOWED_SECTIONS = [
     "list-of-services-under-rts-act"
 ]
 
-# Initialize Gemini (Vertex AI)
+# Initialize Gemini (Vertex AI mode)
 genai_client = genai.Client(
     vertexai=True,
     project=PROJECT_ID,
@@ -40,6 +40,20 @@ genai_client = genai.Client(
 )
 
 app = Flask(__name__)
+
+# =====================
+# LANGUAGE DETECTION
+# =====================
+
+def detect_language(text: str) -> str:
+    """
+    Detect Marathi vs English using Unicode range.
+    """
+    for ch in text:
+        if 0x0900 <= ord(ch) <= 0x097F:
+            return "mr"
+    return "en"
+
 
 # =====================
 # GCS HELPERS
@@ -65,10 +79,21 @@ def build_context(sections):
             data = load_section(section)
             chunks = data.get("chunks", [])
 
-            if chunks:
-                texts.extend(chunks[:3])  # cap chunks per section
-                if data.get("source_url"):
-                    sources.append(data["source_url"])
+            if not chunks:
+                continue
+
+            # Increase context for legal / RTS documents
+            if section in [
+                "right-to-public-service-act",
+                "rts-gazette",
+                "list-of-services-under-rts-act"
+            ]:
+                texts.extend(chunks[:6])
+            else:
+                texts.extend(chunks[:3])
+
+            if data.get("source_url"):
+                sources.append(data["source_url"])
 
         except Exception:
             continue
@@ -77,27 +102,30 @@ def build_context(sections):
 
 
 # =====================
-# SEMANTIC ROUTING (GEMINI-BASED)
+# SEMANTIC ROUTING
 # =====================
 
 def semantic_route_sections(question: str):
     """
-    Uses Gemini to semantically determine relevant sections.
-    Returns a safe subset of ALLOWED_SECTIONS.
+    Uses Gemini to determine relevant MIDC sections.
+    RTS queries always include all RTS documents.
     """
 
     routing_prompt = f"""
 You are a routing assistant for an official government information system.
 
-From the list of allowed sections below, choose the MOST relevant sections
-for answering the user question.
+From the list of allowed sections below, choose ALL sections
+that are relevant to answer the user question.
 
 Allowed sections:
 {", ".join(ALLOWED_SECTIONS)}
 
-Rules:
+IMPORTANT RULES:
+- If the question mentions RTS, Act, Gazette, Rules, or Public Service,
+  you MUST include ALL of:
+  ["right-to-public-service-act", "rts-gazette", "list-of-services-under-rts-act"]
 - Choose ONLY from the allowed sections
-- Return ONLY a valid JSON array (no text)
+- Return ONLY a valid JSON array
 - If unsure, return ["about-midc"]
 
 User question:
@@ -113,16 +141,14 @@ User question:
                     parts=[types.Part(text=routing_prompt)]
                 )
             ],
-            generation_config={
-                "temperature": 0.0
-            }
+            generation_config={"temperature": 0.0}
         )
 
         sections = json.loads(response.text.strip())
 
         if isinstance(sections, list):
-            valid_sections = [s for s in sections if s in ALLOWED_SECTIONS]
-            return valid_sections if valid_sections else ["about-midc"]
+            valid = [s for s in sections if s in ALLOWED_SECTIONS]
+            return valid if valid else ["about-midc"]
 
     except Exception:
         pass
@@ -143,14 +169,22 @@ def chat():
         if not question:
             return jsonify({"error": "Question is required"}), 400
 
+        # Language detection
+        language = detect_language(question)
+        language_instruction = (
+            "Respond in Marathi." if language == "mr"
+            else "Respond in English."
+        )
+
         # Semantic routing
         sections = semantic_route_sections(question)
 
-        # Load grounded context
+        # Build grounded context
         context, sources = build_context(sections)
 
         prompt = f"""
-You are an official information assistant for MIDC (Maharashtra Industrial Development Corporation).
+You are an official information assistant for
+MIDC (Maharashtra Industrial Development Corporation).
 
 Use the content below as the PRIMARY source.
 If the content partially answers the question, summarize what is available.
@@ -168,6 +202,7 @@ INSTRUCTIONS:
 - Be factual and concise
 - Do not hallucinate
 - Base answers strictly on the content
+- {language_instruction}
 """
 
         response = genai_client.models.generate_content(
