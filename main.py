@@ -15,7 +15,24 @@ PROJECT_ID = os.environ.get("GOOGLE_CLOUD_PROJECT")
 LOCATION = "us-central1"
 MODEL_NAME = "gemini-2.0-flash-001"
 
-# Initialize Gen AI client (Vertex AI mode)
+# Allowed content sections (authoritative list)
+ALLOWED_SECTIONS = [
+    "about-midc",
+    "about-maharashtra",
+    "departments-of-midc",
+    "faq",
+    "investors",
+    "customers",
+    "country-desk",
+    "focus-sectors",
+    "contact",
+    "important-notice",
+    "right-to-public-service-act",
+    "rts-gazette",
+    "list-of-services-under-rts-act"
+]
+
+# Initialize Gemini (Vertex AI)
 genai_client = genai.Client(
     vertexai=True,
     project=PROJECT_ID,
@@ -34,83 +51,10 @@ def load_section(section: str):
     blob = bucket.blob(f"{section}/content.json")
 
     if not blob.exists():
-        raise FileNotFoundError(f"No content.json for section: {section}")
+        raise FileNotFoundError(f"Missing content.json for section: {section}")
 
     return json.loads(blob.download_as_text())
 
-
-# =====================
-# SECTION DETECTION
-# =====================
-
-def detect_sections(query: str):
-    q = query.lower()
-    sections = set()
-
-    # ABOUT MIDC (critical fix)
-    if any(k in q for k in [
-        "about", "midc", "what is midc", "tell me about midc"
-    ]):
-        sections.add("about-midc")
-
-    # Vision / Mission / Objectives
-    if any(k in q for k in [
-        "vision", "mission", "objective", "objectives"
-    ]):
-        sections.add("about-midc")
-
-    # Maharashtra
-    if "maharashtra" in q:
-        sections.add("about-maharashtra")
-
-    # Organisation / Departments
-    if any(k in q for k in [
-        "department", "organisation", "organization", "structure"
-    ]):
-        sections.add("departments-of-midc")
-
-    # FAQ
-    if any(k in q for k in ["faq", "frequently asked"]):
-        sections.add("faq")
-
-    # Investors
-    if any(k in q for k in ["investor", "investment"]):
-        sections.add("investors")
-
-    # Customers
-    if "customer" in q:
-        sections.add("customers")
-
-    # Focus sectors
-    if any(k in q for k in ["sector", "industry", "focus"]):
-        sections.add("focus-sectors")
-
-    # Contact
-    if any(k in q for k in ["contact", "address", "reach"]):
-        sections.add("contact")
-
-    # Notices
-    if any(k in q for k in ["notice", "circular"]):
-        sections.add("important-notice")
-
-    # RTS / Acts
-    if any(k in q for k in ["rts", "right to service", "act", "gazette"]):
-        sections.update([
-            "right-to-public-service-act",
-            "rts-gazette",
-            "list-of-services-under-rts-act"
-        ])
-
-    # Safe fallback
-    if not sections:
-        sections.add("about-midc")
-
-    return list(sections)
-
-
-# =====================
-# CONTEXT BUILDER
-# =====================
 
 def build_context(sections):
     texts = []
@@ -120,15 +64,70 @@ def build_context(sections):
         try:
             data = load_section(section)
             chunks = data.get("chunks", [])
+
             if chunks:
-                texts.extend(chunks[:3])  # cap per section
+                texts.extend(chunks[:3])  # cap chunks per section
                 if data.get("source_url"):
                     sources.append(data["source_url"])
-        except Exception as e:
-            print(f"[WARN] Failed loading section '{section}': {e}")
 
-    context = "\n\n".join(texts)
-    return context, list(set(sources))
+        except Exception:
+            continue
+
+    return "\n\n".join(texts), list(set(sources))
+
+
+# =====================
+# SEMANTIC ROUTING (GEMINI-BASED)
+# =====================
+
+def semantic_route_sections(question: str):
+    """
+    Uses Gemini to semantically determine relevant sections.
+    Returns a safe subset of ALLOWED_SECTIONS.
+    """
+
+    routing_prompt = f"""
+You are a routing assistant for an official government information system.
+
+From the list of allowed sections below, choose the MOST relevant sections
+for answering the user question.
+
+Allowed sections:
+{", ".join(ALLOWED_SECTIONS)}
+
+Rules:
+- Choose ONLY from the allowed sections
+- Return ONLY a valid JSON array (no text)
+- If unsure, return ["about-midc"]
+
+User question:
+{question}
+"""
+
+    try:
+        response = genai_client.models.generate_content(
+            model=MODEL_NAME,
+            contents=[
+                types.Content(
+                    role="user",
+                    parts=[types.Part(text=routing_prompt)]
+                )
+            ],
+            generation_config={
+                "temperature": 0.0
+            }
+        )
+
+        sections = json.loads(response.text.strip())
+
+        if isinstance(sections, list):
+            valid_sections = [s for s in sections if s in ALLOWED_SECTIONS]
+            return valid_sections if valid_sections else ["about-midc"]
+
+    except Exception:
+        pass
+
+    return ["about-midc"]
 
 
 # =====================
@@ -144,21 +143,19 @@ def chat():
         if not question:
             return jsonify({"error": "Question is required"}), 400
 
-        sections = detect_sections(question)
-        context, sources = build_context(sections)
+        # Semantic routing
+        sections = semantic_route_sections(question)
 
-        # DEBUG (can be removed later)
-        print("QUESTION:", question)
-        print("SECTIONS:", sections)
-        print("CONTEXT LENGTH:", len(context))
-        print("SOURCES:", sources)
+        # Load grounded context
+        context, sources = build_context(sections)
 
         prompt = f"""
 You are an official information assistant for MIDC (Maharashtra Industrial Development Corporation).
 
 Use the content below as the PRIMARY source.
 If the content partially answers the question, summarize what is available.
-Only say "The requested information is not available on MIDC's official website"
+Only respond with:
+"The requested information is not available on MIDC's official website."
 if the content is completely unrelated.
 
 CONTENT:
@@ -195,7 +192,6 @@ INSTRUCTIONS:
         })
 
     except Exception as e:
-        print("[ERROR]", str(e))
         return jsonify({
             "error": "Internal processing error",
             "details": str(e)
