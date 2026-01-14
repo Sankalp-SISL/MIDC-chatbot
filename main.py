@@ -1,210 +1,157 @@
 import os
 import json
-from flask import Flask, request, jsonify
+import time
+import hashlib
+from urllib.parse import urljoin, urlparse
+
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.common.exceptions import TimeoutException, WebDriverException
+
+from bs4 import BeautifulSoup
 from google.cloud import storage
 
-from google import genai
-from google.genai import types
-
 # =====================
-# CONFIGURATION
+# CONFIG
 # =====================
 
+START_URL = "https://www.midcindia.org"
+ALLOWED_DOMAIN = "midcindia.org"
 BUCKET_NAME = "midc-general-chatbot-bucket-web-data"
-PROJECT_ID = os.environ.get("GOOGLE_CLOUD_PROJECT")
-LOCATION = "us-central1"
-MODEL_NAME = "gemini-2.0-flash-001"
+MAX_DEPTH = 5
+PAGE_TIMEOUT = 20
 
-ALLOWED_SECTIONS = [
-    "about-midc",
-    "about-maharashtra",
-    "departments-of-midc",
-    "faq",
-    "investors",
-    "customers",
-    "country-desk",
-    "focus-sectors",
-    "contact",
-    "important-notice",
-    "right-to-public-service-act",
-    "rts-gazette",
-    "list-of-services-under-rts-act"
-]
-
-genai_client = genai.Client(
-    vertexai=True,
-    project=PROJECT_ID,
-    location=LOCATION
-)
-
-app = Flask(__name__)
+visited = set()
 
 # =====================
-# CORS (REQUIRED FOR BROWSER)
+# DRIVER SETUP
 # =====================
 
-@app.after_request
-def add_cors_headers(response):
-    response.headers["Access-Control-Allow-Origin"] = "*"
-    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
-    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
-    return response
+def create_driver():
+    options = Options()
+    options.add_argument("--headless")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    return webdriver.Chrome(options=options)
 
 # =====================
-# LANGUAGE DETECTION
+# UTILS
 # =====================
 
-def detect_language(text: str) -> str:
-    for ch in text:
-        if 0x0900 <= ord(ch) <= 0x097F:
-            return "mr"
-    return "en"
+def is_internal(url):
+    return ALLOWED_DOMAIN in urlparse(url).netloc
 
-# =====================
-# GCS HELPERS
-# =====================
+def url_id(url):
+    return hashlib.sha256(url.encode()).hexdigest()[:16]
 
-def load_section(section: str):
+def upload_json(path, data):
     client = storage.Client()
     bucket = client.bucket(BUCKET_NAME)
-    blob = bucket.blob(f"{section}/content.json")
-
-    if not blob.exists():
-        raise FileNotFoundError(f"Missing content.json for section: {section}")
-
-    return json.loads(blob.download_as_text())
-
-def build_context(sections):
-    texts = []
-    sources = []
-
-    for section in sections:
-        try:
-            data = load_section(section)
-            chunks = data.get("chunks", [])
-
-            if not chunks:
-                continue
-
-            if section in [
-                "right-to-public-service-act",
-                "rts-gazette",
-                "list-of-services-under-rts-act"
-            ]:
-                texts.extend(chunks[:6])
-            else:
-                texts.extend(chunks[:3])
-
-            if data.get("source_url"):
-                sources.append(data["source_url"])
-
-        except Exception:
-            continue
-
-    return "\n\n".join(texts), list(set(sources))
+    blob = bucket.blob(path)
+    blob.upload_from_string(json.dumps(data, indent=2), content_type="application/json")
 
 # =====================
-# SEMANTIC ROUTING
+# PAGE EXTRACTION
 # =====================
 
-def semantic_route_sections(question: str):
+def extract_page(driver, url):
+    page_data = {
+        "url": url,
+        "title": "",
+        "meta": {},
+        "text": "",
+        "links": [],
+        "forms": [],
+        "buttons": []
+    }
 
-    routing_prompt = f"""
-You are a routing assistant for an official government information system.
+    soup = BeautifulSoup(driver.page_source, "html.parser")
 
-Allowed sections:
-{", ".join(ALLOWED_SECTIONS)}
+    page_data["title"] = soup.title.text.strip() if soup.title else ""
 
-RULES:
-- RTS / Act / Gazette questions MUST include:
-  ["right-to-public-service-act", "rts-gazette", "list-of-services-under-rts-act"]
-- Choose ONLY from allowed sections
-- Return ONLY a JSON array
-- If unsure, return ["about-midc"]
+    for meta in soup.find_all("meta"):
+        if meta.get("name") and meta.get("content"):
+            page_data["meta"][meta["name"]] = meta["content"]
 
-Question:
-{question}
-"""
+    page_data["text"] = " ".join(soup.stripped_strings)
 
-    try:
-        response = genai_client.models.generate_content(
-            model=MODEL_NAME,
-            contents=[types.Content(role="user", parts=[types.Part(text=routing_prompt)])],
-            generation_config={"temperature": 0.0}
-        )
-
-        sections = json.loads(response.text.strip())
-        valid = [s for s in sections if s in ALLOWED_SECTIONS]
-        return valid if valid else ["about-midc"]
-
-    except Exception:
-        return ["about-midc"]
-
-# =====================
-# ROUTES
-# =====================
-
-@app.route("/chat", methods=["POST", "OPTIONS"])
-def chat():
-    if request.method == "OPTIONS":
-        return jsonify({}), 200
-
-    try:
-        body = request.get_json(silent=True) or {}
-        question = body.get("question", "").strip()
-
-        if not question:
-            return jsonify({"error": "Question is required"}), 400
-
-        language = detect_language(question)
-        language_instruction = (
-            "Respond in Marathi." if language == "mr"
-            else "Respond in English."
-        )
-
-        sections = semantic_route_sections(question)
-        context, sources = build_context(sections)
-
-        prompt = f"""
-You are an official information assistant for MIDC.
-
-CONTENT:
-{context}
-
-QUESTION:
-{question}
-
-RULES:
-- Answer strictly from content
-- No hallucination
-- {language_instruction}
-"""
-
-        response = genai_client.models.generate_content(
-            model=MODEL_NAME,
-            contents=[types.Content(role="user", parts=[types.Part(text=prompt)])]
-        )
-
-        answer_text = (
-            response.text.strip()
-            if response and response.text
-            else "The requested information is not available on MIDC's official website."
-        )
-
-        return jsonify({
-            "answer": answer_text,
-            "sources": sources
+    # Links
+    for a in soup.find_all("a", href=True):
+        href = urljoin(url, a["href"])
+        page_data["links"].append({
+            "text": a.get_text(strip=True),
+            "url": href,
+            "internal": is_internal(href)
         })
 
-    except Exception as e:
-        return jsonify({
-            "error": "Internal processing error",
-            "details": str(e)
-        }), 500
+    # Forms
+    for form in soup.find_all("form"):
+        fields = []
+        for inp in form.find_all(["input", "select", "textarea"]):
+            fields.append({
+                "name": inp.get("name"),
+                "type": inp.get("type", inp.name),
+                "required": inp.has_attr("required")
+            })
 
-@app.route("/", methods=["GET"])
-def health():
-    return "MIDC Chatbot is running", 200
+        page_data["forms"].append({
+            "action": form.get("action"),
+            "method": form.get("method", "GET"),
+            "fields": fields
+        })
+
+    # Buttons
+    for btn in soup.find_all("button"):
+        page_data["buttons"].append(btn.get_text(strip=True))
+
+    return page_data
+
+# =====================
+# CRAWLER
+# =====================
+
+def crawl(url, depth=0):
+    if depth > MAX_DEPTH or url in visited:
+        return
+
+    visited.add(url)
+    driver = None
+
+    try:
+        driver = create_driver()
+        driver.set_page_load_timeout(PAGE_TIMEOUT)
+        driver.get(url)
+        time.sleep(2)
+
+        page = extract_page(driver, url)
+        pid = url_id(url)
+
+        upload_json(f"pages/{pid}.json", page)
+
+        for link in page["links"]:
+            if link["internal"]:
+                crawl(link["url"], depth + 1)
+            else:
+                upload_json(
+                    f"external_links/{url_id(link['url'])}.json",
+                    link
+                )
+
+    except Exception as e:
+        upload_json(
+            f"errors/{url_id(url)}.json",
+            {"url": url, "error": str(e)}
+        )
+
+    finally:
+        if driver:
+            driver.quit()
+
+# =====================
+# ENTRYPOINT
+# =====================
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+    crawl(START_URL)
