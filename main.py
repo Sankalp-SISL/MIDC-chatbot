@@ -1,114 +1,161 @@
 import os
 import json
-import time
 from flask import Flask, request, jsonify
 from google.cloud import storage
 from google import genai
 from google.genai import types
 
-BUCKET = "midc-general-chatbot-bucket-web-data"
+# =====================
+# CONFIGURATION
+# =====================
+
+BUCKET_NAME = "midc-general-chatbot-bucket-web-data"
 PROJECT_ID = os.environ.get("GOOGLE_CLOUD_PROJECT")
 LOCATION = "us-central1"
-MODEL = "gemini-2.0-flash-001"
+MODEL_NAME = "gemini-2.0-flash-001"
 
-client = genai.Client(vertexai=True, project=PROJECT_ID, location=LOCATION)
+genai_client = genai.Client(
+    vertexai=True,
+    project=PROJECT_ID,
+    location=LOCATION
+)
+
+storage_client = storage.Client()
+bucket = storage_client.bucket(BUCKET_NAME)
+
 app = Flask(__name__)
 
+# =====================
+# CORS
+# =====================
+
 @app.after_request
-def cors(resp):
-    resp.headers["Access-Control-Allow-Origin"] = "*"
-    resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
-    resp.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS, GET"
-    return resp
+def add_cors_headers(response):
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    response.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS, GET"
+    return response
 
+# =====================
+# LANGUAGE DETECTION
+# =====================
 
-def detect_lang(text):
+def detect_language(text: str) -> str:
     return "mr" if any(0x0900 <= ord(c) <= 0x097F for c in text) else "en"
 
+# =====================
+# SAFE GCS LOADING
+# =====================
 
-def load_all():
-    client = storage.Client()
-    bucket = client.bucket(BUCKET)
+def load_relevant_documents(limit=15):
+    """
+    Loads a limited number of documents safely.
+    """
     docs = []
-
-    for blob in bucket.list_blobs():
-        docs.append(json.loads(blob.download_as_text()))
+    try:
+        for blob in bucket.list_blobs():
+            if not blob.name.endswith("content.json"):
+                continue
+            docs.append(json.loads(blob.download_as_text()))
+            if len(docs) >= limit:
+                break
+    except Exception:
+        pass
     return docs
 
+# =====================
+# SEMANTIC FILTERING
+# =====================
 
-DOCS = load_all()
+def semantic_filter(question, docs):
+    """
+    Uses Gemini to select relevant documents.
+    """
+    index_map = {i: d for i, d in enumerate(docs)}
 
+    summary = "\n".join(
+        f"[{i}] {d.get('section')} - {d.get('source_url')}"
+        for i, d in index_map.items()
+    )
 
-def semantic_match(question):
     prompt = f"""
-Select relevant documents to answer:
-{question}
+From the document list below, choose the most relevant ones
+to answer the question.
 
 Return JSON array of indices.
+
+Documents:
+{summary}
+
+Question:
+{question}
 """
-    r = client.models.generate_content(
-        model=MODEL,
-        contents=[types.Content(role="user", parts=[types.Part(text=prompt)])],
-        generation_config={"temperature": 0}
-    )
+
     try:
-        return json.loads(r.text)
-    except:
+        r = genai_client.models.generate_content(
+            model=MODEL_NAME,
+            contents=[types.Content(role="user", parts=[types.Part(text=prompt)])],
+            generation_config={"temperature": 0}
+        )
+        idxs = json.loads(r.text.strip())
+        return [index_map[i] for i in idxs if i in index_map]
+    except Exception:
         return []
 
+# =====================
+# CHAT ROUTE
+# =====================
 
 @app.route("/chat", methods=["POST", "OPTIONS"])
 def chat():
     if request.method == "OPTIONS":
         return jsonify({}), 200
 
-    q = request.json.get("question", "").strip()
-    if not q:
-        return jsonify({"error": "Empty question"}), 400
+    body = request.get_json(silent=True) or {}
+    question = body.get("question", "").strip()
 
-    lang = detect_lang(q)
-    doc_idxs = semantic_match(q)
+    if not question:
+        return jsonify({"error": "Question is required"}), 400
+
+    language = detect_language(question)
+
+    docs = load_relevant_documents()
+    matched_docs = semantic_filter(question, docs)
 
     context = []
     pages = []
     forms = []
     links = []
 
-    for i in doc_idxs[:6]:
-        try:
-            d = DOCS[i]
-            context.extend(d.get("chunks", [])[:2])
-            if d.get("source_url"):
-                pages.append({
-                    "title": d["section"].replace("-", " ").title(),
-                    "url": d["source_url"]
-                })
-            forms.extend(d.get("forms", []))
-            links.extend(d.get("related_links", []))
-        except:
-            pass
+    for d in matched_docs:
+        context.extend(d.get("chunks", [])[:2])
+        if d.get("source_url"):
+            pages.append({
+                "title": d.get("section", "").replace("-", " ").title(),
+                "url": d["source_url"]
+            })
+        forms.extend(d.get("forms", []))
+        links.extend(d.get("related_links", []))
 
     prompt = f"""
 You are an official MIDC website assistant.
 
-Answer strictly from context.
-If action exists, guide user.
+Use ONLY the information provided below.
+If a page or form exists, guide the user to it.
 
 Context:
 {chr(10).join(context)}
 
 Question:
-{q}
+{question}
 
-Language: {"Marathi" if lang=="mr" else "English"}
+Respond in {"Marathi" if language == "mr" else "English"}.
 """
 
-    resp = client.models.generate_content(
-        model=MODEL,
+    response = genai_client.models.generate_content(
+        model=MODEL_NAME,
         contents=[types.Content(role="user", parts=[types.Part(text=prompt)])]
     )
-
-    confidence = min(1.0, len(context) / 10)
 
     follow_up = None
     if forms:
@@ -117,22 +164,20 @@ Language: {"Marathi" if lang=="mr" else "English"}
         follow_up = "Would you like me to open the relevant page or guide you further?"
 
     return jsonify({
-        "answer": resp.text.strip(),
-        "confidence_score": round(confidence, 2),
+        "answer": response.text.strip(),
         "recommended_pages": pages,
         "forms_detected": forms,
         "external_links": links,
+        "confidence_score": round(min(1.0, len(context) / 8), 2),
         "conversation_state": {
-            "should_follow_up": True if follow_up else False,
+            "should_follow_up": bool(follow_up),
             "follow_up_message": follow_up
         }
     })
 
-
 @app.route("/", methods=["GET"])
 def health():
     return "MIDC Agentic Assistant running", 200
-
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
