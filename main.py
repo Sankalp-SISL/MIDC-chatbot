@@ -45,7 +45,28 @@ def detect_language(text: str) -> str:
     return "en"
 
 # =====================
-# INTERNET MODE TRIGGER
+# 🔒 MIDC ENTITY SAFETY LOCK (NEW)
+# =====================
+
+MIDC_ENTITY_KEYWORDS = [
+    "ceo",
+    "managing director",
+    "md",
+    "chairman",
+    "contact",
+    "email",
+    "phone",
+    "officer",
+    "official",
+    "midc head"
+]
+
+def is_midc_entity_query(question: str) -> bool:
+    q = question.lower()
+    return any(k in q for k in MIDC_ENTITY_KEYWORDS)
+
+# =====================
+# INTERNET MODE TRIGGER (UNCHANGED)
 # =====================
 
 def is_internet_query(question: str, mode: str | None):
@@ -98,11 +119,18 @@ def load_all_content():
     return pages, pdfs, forms, external_links
 
 # =====================
-# CONTEXT BUILDER
+# CONTEXT BUILDER (BOOSTED)
 # =====================
 
-def build_context(pages, pdfs):
+def build_context(pages, pdfs, force_leadership=False):
     context_chunks = []
+
+    # 🔹 Force About / Contact pages for leadership queries
+    if force_leadership:
+        for p in pages:
+            title = (p.get("title") or "").lower()
+            if any(k in title for k in ["about", "contact", "midc"]):
+                context_chunks.extend(p.get("chunks", [])[:4])
 
     for p in pages[:8]:
         context_chunks.extend(p.get("chunks", [])[:2])
@@ -113,7 +141,7 @@ def build_context(pages, pdfs):
     return "\n\n".join(context_chunks)
 
 # =====================
-# INTERNET ANSWER (CONTROLLED)
+# INTERNET ANSWER (CONTROLLED – UNCHANGED)
 # =====================
 
 def internet_answer(question, language_instruction):
@@ -171,10 +199,16 @@ def chat():
     )
 
     # =====================
-    # INTERNET MODE
+    # 🔒 MIDC ENTITY ALWAYS WINS (NEW)
     # =====================
 
-    if is_internet_query(question, mode):
+    force_midc = is_midc_entity_query(question)
+
+    # =====================
+    # INTERNET MODE (GUARDED)
+    # =====================
+
+    if not force_midc and is_internet_query(question, mode):
         answer = internet_answer(question, language_instruction)
 
         return jsonify({
@@ -190,11 +224,11 @@ def chat():
         })
 
     # =====================
-    # MIDC MODE
+    # MIDC MODE (PRIMARY)
     # =====================
 
     pages, pdfs, forms, external_links = load_all_content()
-    context = build_context(pages, pdfs)
+    context = build_context(pages, pdfs, force_leadership=force_midc)
 
     prompt = f"""
 You are an official AI assistant for
@@ -214,7 +248,7 @@ MANDATORY FORMAT RULES:
 - Use <ul><li> for lists
 - Use <a href=""> for links
 - Clean spacing with <br>
-- If information is missing, guide user to exact page or form
+- If information exists, answer confidently
 - If external site exists (land rates, tenders), mention and link it
 - Do NOT hallucinate
 - {language_instruction}
