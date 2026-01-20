@@ -122,20 +122,45 @@ def load_all_content():
 # CONTEXT BUILDER (BOOSTED)
 # =====================
 
-def build_context(pages, pdfs, force_leadership=False):
+CONTACT_KEYWORDS = [
+    "contact", "email", "phone", "address",
+    "office", "helpline", "reach", "connect"
+]
+
+def is_contact_query(question: str) -> bool:
+    q = question.lower()
+    return any(k in q for k in CONTACT_KEYWORDS)
+
+def build_context(pages, pdfs, question: str):
     context_chunks = []
+    q = question.lower()
 
-    # 🔹 Force About / Contact pages for leadership queries
-    if force_leadership:
+    # 🔹 1. HARD PRIORITY: CONTACT PAGE
+    if is_contact_query(question):
         for p in pages:
-            title = (p.get("title") or "").lower()
-            if any(k in title for k in ["about", "contact", "midc"]):
-                context_chunks.extend(p.get("chunks", [])[:4])
+            if "contact" in (p.get("section", "") or "").lower():
+                context_chunks.extend(p.get("chunks", [])[:6])
 
-    for p in pages[:8]:
-        context_chunks.extend(p.get("chunks", [])[:2])
+    # 🔹 2. KEYWORD-RELEVANT PAGES
+    scored_pages = []
+    for p in pages:
+        title = (p.get("section") or "").lower()
+        score = sum(1 for w in q.split() if w in title)
+        scored_pages.append((score, p))
 
-    for p in pdfs[:5]:
+    scored_pages.sort(reverse=True, key=lambda x: x[0])
+
+    for score, p in scored_pages[:5]:
+        if score > 0:
+            context_chunks.extend(p.get("chunks", [])[:3])
+
+    # 🔹 3. FALLBACK PAGES
+    if len(context_chunks) < 6:
+        for p in pages[:5]:
+            context_chunks.extend(p.get("chunks", [])[:2])
+
+    # 🔹 4. PDFs (LAST)
+    for p in pdfs[:3]:
         context_chunks.extend(p.get("chunks", [])[:2])
 
     return "\n\n".join(context_chunks)
@@ -228,7 +253,7 @@ def chat():
     # =====================
 
     pages, pdfs, forms, external_links = load_all_content()
-    context = build_context(pages, pdfs, force_leadership=force_midc)
+    context = build_context(pages, pdfs, question)
 
     prompt = f"""
 You are an official AI assistant for
@@ -287,6 +312,15 @@ MANDATORY FORMAT RULES:
         }
     })
 
+if is_contact_query(question):
+    prompt += """
+IMPORTANT:
+- This is a CONTACT-related query
+- Extract and present contact details if present
+- Include official contact page link
+- Do NOT give generic advice
+"""
+
 # =====================
 # HEALTH CHECK
 # =====================
@@ -297,3 +331,4 @@ def health():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+
