@@ -45,73 +45,59 @@ def detect_language(text: str) -> str:
     return "en"
 
 # =====================
-# 🔒 MIDC ENTITY SAFETY LOCK (NEW)
+# QUERY CLASSIFIERS
 # =====================
 
 MIDC_ENTITY_KEYWORDS = [
-    "ceo",
-    "managing director",
-    "md",
-    "chairman",
-    "contact",
-    "email",
-    "phone",
-    "officer",
-    "official",
-    "midc head"
+    "ceo", "managing director", "md",
+    "chairman", "contact", "email",
+    "phone", "officer", "official",
+    "helpline", "address"
+]
+
+INTERNET_EXPLICIT_KEYWORDS = [
+    "search internet",
+    "search web",
+    "use internet",
+    "google this",
+    "outside midc"
 ]
 
 def is_midc_entity_query(question: str) -> bool:
     q = question.lower()
     return any(k in q for k in MIDC_ENTITY_KEYWORDS)
 
-# =====================
-# INTERNET MODE TRIGGER (UNCHANGED)
-# =====================
-
-def is_internet_query(question: str, mode: str | None):
+def is_explicit_internet_query(question: str, mode: str | None) -> bool:
     if mode == "internet":
         return True
-
-    triggers = [
-        "search internet",
-        "search web",
-        "outside midc",
-        "general knowledge",
-        "latest news",
-        "google"
-    ]
-    return any(t in question.lower() for t in triggers)
+    q = question.lower()
+    return any(k in q for k in INTERNET_EXPLICIT_KEYWORDS)
 
 # =====================
-# LOAD ALL GCS CONTENT
+# LOAD GCS CONTENT
 # =====================
 
 def load_all_content():
     client = storage.Client()
     bucket = client.bucket(BUCKET_NAME)
-    blobs = bucket.list_blobs()
 
     pages, pdfs, forms, external_links = [], [], [], []
 
-    for blob in blobs:
+    for blob in bucket.list_blobs():
         if not blob.name.endswith(".json"):
             continue
 
         try:
             data = json.loads(blob.download_as_text())
-            meta = data.get("metadata", {})
-
-            content_type = meta.get("type", "page")
+            content_type = data.get("content_type", "html")
 
             if content_type == "pdf":
                 pdfs.append(data)
-            elif content_type == "form":
-                forms.append(data)
-            elif content_type == "external":
-                external_links.append(data)
             else:
                 pages.append(data)
+
+            external_links.extend(data.get("related_links", []))
+            forms.extend(data.get("forms", []))
 
         except Exception:
             continue
@@ -119,73 +105,61 @@ def load_all_content():
     return pages, pdfs, forms, external_links
 
 # =====================
-# CONTEXT BUILDER (BOOSTED)
+# CONTEXT BUILDER
 # =====================
 
-CONTACT_KEYWORDS = [
-    "contact", "email", "phone", "address",
-    "office", "helpline", "reach", "connect"
-]
-
-def is_contact_query(question: str) -> bool:
-    q = question.lower()
-    return any(k in q for k in CONTACT_KEYWORDS)
-
 def build_context(pages, pdfs, question: str):
-    context_chunks = []
     q = question.lower()
+    chunks = []
 
-    # 🔹 1. HARD PRIORITY: CONTACT PAGE
-    if is_contact_query(question):
+    # 🔒 HARD PRIORITY: CONTACT PAGE
+    if any(k in q for k in ["contact", "email", "phone", "ceo", "md"]):
         for p in pages:
             if "contact" in (p.get("section", "") or "").lower():
-                context_chunks.extend(p.get("chunks", [])[:6])
+                chunks.extend(p.get("chunks", [])[:6])
 
-    # 🔹 2. KEYWORD-RELEVANT PAGES
-    scored_pages = []
+    # 🔹 KEYWORD MATCH
+    scored = []
     for p in pages:
         title = (p.get("section") or "").lower()
         score = sum(1 for w in q.split() if w in title)
-        scored_pages.append((score, p))
+        scored.append((score, p))
 
-    scored_pages.sort(reverse=True, key=lambda x: x[0])
+    scored.sort(reverse=True, key=lambda x: x[0])
 
-    for score, p in scored_pages[:5]:
+    for score, p in scored[:5]:
         if score > 0:
-            context_chunks.extend(p.get("chunks", [])[:3])
+            chunks.extend(p.get("chunks", [])[:3])
 
-    # 🔹 3. FALLBACK PAGES
-    if len(context_chunks) < 6:
+    # 🔹 FALLBACK
+    if len(chunks) < 6:
         for p in pages[:5]:
-            context_chunks.extend(p.get("chunks", [])[:2])
+            chunks.extend(p.get("chunks", [])[:2])
 
-    # 🔹 4. PDFs (LAST)
+    # 🔹 PDFs LAST
     for p in pdfs[:3]:
-        context_chunks.extend(p.get("chunks", [])[:2])
+        chunks.extend(p.get("chunks", [])[:2])
 
-    return "\n\n".join(context_chunks)
+    return "\n\n".join(chunks)
 
 # =====================
-# INTERNET ANSWER (CONTROLLED – UNCHANGED)
+# INTERNET ANSWER (SAFE)
 # =====================
 
 def internet_answer(question, language_instruction):
     response = genai_client.models.generate_content(
         model=MODEL_NAME,
-        contents=[
-            types.Content(
-                role="user",
-                parts=[types.Part(
-                    text=f"""
-You are an assistant using Google Search.
+        contents=[types.Content(
+            role="user",
+            parts=[types.Part(
+                text=f"""
+Answer this using general public knowledge.
 
 IMPORTANT:
-- This information is NOT official MIDC data
+- This is NOT official MIDC information
+- Clearly state this disclaimer
 - Do NOT hallucinate
-- Use ONLY verifiable web results
-- Respond in valid HTML ONLY
-- No markdown
-- No '*' or '**'
+- Output VALID HTML ONLY
 - Use <strong>, <ul>, <li>, <a>
 
 {language_instruction}
@@ -193,16 +167,14 @@ IMPORTANT:
 QUESTION:
 {question}
 """
-                )]
-            )
-        ],
-        tools=[types.Tool(google_search=types.GoogleSearch())]
+            )]
+        )]
     )
 
     return response.text if response and response.text else None
 
 # =====================
-# MAIN CHAT ROUTE
+# CHAT ENDPOINT
 # =====================
 
 @app.route("/chat", methods=["POST", "OPTIONS"])
@@ -210,7 +182,7 @@ def chat():
     if request.method == "OPTIONS":
         return jsonify({}), 200
 
-    body = request.get_json() or {}
+    body = request.get_json(silent=True) or {}
     question = body.get("question", "").strip()
     mode = body.get("mode")
 
@@ -223,17 +195,11 @@ def chat():
         else "Respond in English."
     )
 
-    # =====================
-    # 🔒 MIDC ENTITY ALWAYS WINS (NEW)
-    # =====================
-
+    # 🔒 MIDC ENTITY OVERRIDE
     force_midc = is_midc_entity_query(question)
 
-    # =====================
-    # INTERNET MODE (GUARDED)
-    # =====================
-
-    if not force_midc and is_internet_query(question, mode):
+    # 🌐 INTERNET MODE (EXPLICIT ONLY)
+    if not force_midc and is_explicit_internet_query(question, mode):
         answer = internet_answer(question, language_instruction)
 
         return jsonify({
@@ -248,10 +214,7 @@ def chat():
             }
         })
 
-    # =====================
-    # MIDC MODE (PRIMARY)
-    # =====================
-
+    # 🏛 MIDC MODE
     pages, pdfs, forms, external_links = load_all_content()
     context = build_context(pages, pdfs, question)
 
@@ -265,16 +228,14 @@ CONTENT:
 QUESTION:
 {question}
 
-MANDATORY FORMAT RULES:
+MANDATORY RULES:
 - OUTPUT VALID HTML ONLY
 - NO markdown
 - NO '*' or '**'
-- Use <strong> for headings
-- Use <ul><li> for lists
-- Use <a href=""> for links
-- Clean spacing with <br>
-- If information exists, answer confidently
-- If external site exists (land rates, tenders), mention and link it
+- Use <strong>, <ul>, <li>, <a>
+- Extract factual information directly
+- If contact-related, show phone/email/address clearly
+- Link the exact MIDC page
 - Do NOT hallucinate
 - {language_instruction}
 """
@@ -284,10 +245,8 @@ MANDATORY FORMAT RULES:
         contents=[types.Content(role="user", parts=[types.Part(text=prompt)])]
     )
 
-    answer = (
-        response.text.strip()
-        if response and response.text
-        else "<strong>Information not available on the MIDC website.</strong>"
+    answer = response.text.strip() if response and response.text else (
+        "<strong>Information not available on the MIDC website.</strong>"
     )
 
     return jsonify({
@@ -295,14 +254,12 @@ MANDATORY FORMAT RULES:
         "confidence_score": 0.82,
         "recommended_pages": [
             {
-                "title": p.get("title", "MIDC Page"),
+                "title": p.get("section", "MIDC Page").replace("-", " ").title(),
                 "url": p.get("source_url")
             }
             for p in pages[:3] if p.get("source_url")
         ],
-        "external_links": [
-            l.get("url") for l in external_links[:3] if l.get("url")
-        ],
+        "external_links": external_links[:5],
         "forms_detected": forms[:2],
         "conversation_state": {
             "intent": "midc",
@@ -311,15 +268,6 @@ MANDATORY FORMAT RULES:
                 "Would you like help navigating a page or filling a related form?"
         }
     })
-
-if is_contact_query(question):
-    prompt += """
-IMPORTANT:
-- This is a CONTACT-related query
-- Extract and present contact details if present
-- Include official contact page link
-- Do NOT give generic advice
-"""
 
 # =====================
 # HEALTH CHECK
@@ -331,4 +279,3 @@ def health():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
-
