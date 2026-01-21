@@ -1,6 +1,7 @@
 import os
 import json
 import time
+import re
 from flask import Flask, request, jsonify
 from google.cloud import storage
 from google import genai
@@ -45,14 +46,14 @@ def detect_language(text: str) -> str:
     return "en"
 
 # =====================
-# QUERY CLASSIFIERS
+# 🔒 MIDC ENTITY & QUERY CLASSIFIERS
 # =====================
 
 MIDC_ENTITY_KEYWORDS = [
     "ceo", "managing director", "md",
     "chairman", "contact", "email",
     "phone", "officer", "official",
-    "helpline", "address"
+    "helpline", "address", "head office"
 ]
 
 INTERNET_EXPLICIT_KEYWORDS = [
@@ -72,6 +73,20 @@ def is_explicit_internet_query(question: str, mode: str | None) -> bool:
         return True
     q = question.lower()
     return any(k in q for k in INTERNET_EXPLICIT_KEYWORDS)
+
+# =====================
+# 🧹 LLM OUTPUT CLEANER (NEW – CRITICAL)
+# =====================
+
+def clean_llm_html(text: str) -> str:
+    if not text:
+        return text
+
+    # Remove markdown fences if model adds them
+    text = re.sub(r"^```html", "", text.strip(), flags=re.IGNORECASE)
+    text = re.sub(r"```$", "", text.strip())
+
+    return text.strip()
 
 # =====================
 # LOAD GCS CONTENT
@@ -105,31 +120,37 @@ def load_all_content():
     return pages, pdfs, forms, external_links
 
 # =====================
-# CONTEXT BUILDER
+# CONTEXT BUILDER (BOOSTED, SAFE)
 # =====================
+
+CONTACT_TERMS = [
+    "contact", "email", "phone",
+    "address", "ceo", "md",
+    "helpline", "office"
+]
 
 def build_context(pages, pdfs, question: str):
     q = question.lower()
     chunks = []
 
-    # 🔒 HARD PRIORITY: CONTACT PAGE
-    if any(k in q for k in ["contact", "email", "phone", "ceo", "md"]):
+    # 🔒 HARD PRIORITY: CONTACT / CEO
+    if any(k in q for k in CONTACT_TERMS):
         for p in pages:
             if "contact" in (p.get("section", "") or "").lower():
                 chunks.extend(p.get("chunks", [])[:6])
 
-    # 🔹 KEYWORD MATCH
+    # 🔹 KEYWORD-SCORED PAGES
     scored = []
     for p in pages:
-        title = (p.get("section") or "").lower()
+        title = (p.get("section") or "").replace("-", " ").lower()
         score = sum(1 for w in q.split() if w in title)
-        scored.append((score, p))
+        if score > 0:
+            scored.append((score, p))
 
     scored.sort(reverse=True, key=lambda x: x[0])
 
-    for score, p in scored[:5]:
-        if score > 0:
-            chunks.extend(p.get("chunks", [])[:3])
+    for _, p in scored[:5]:
+        chunks.extend(p.get("chunks", [])[:3])
 
     # 🔹 FALLBACK
     if len(chunks) < 6:
@@ -143,7 +164,31 @@ def build_context(pages, pdfs, question: str):
     return "\n\n".join(chunks)
 
 # =====================
-# INTERNET ANSWER (SAFE)
+# 🔗 RECOMMENDED PAGE MATCHER (NEW)
+# =====================
+
+def recommend_pages(question: str, pages):
+    q = question.lower()
+    scored = []
+
+    for p in pages:
+        section = (p.get("section") or "").replace("-", " ").lower()
+        score = sum(1 for w in q.split() if w in section)
+        if score > 0 and p.get("source_url"):
+            scored.append((score, p))
+
+    scored.sort(reverse=True, key=lambda x: x[0])
+
+    return [
+        {
+            "title": p.get("section", "MIDC Page").replace("-", " ").title(),
+            "url": p.get("source_url")
+        }
+        for _, p in scored[:5]
+    ]
+
+# =====================
+# INTERNET ANSWER (EXPLICIT ONLY – SAFE)
 # =====================
 
 def internet_answer(question, language_instruction):
@@ -153,7 +198,7 @@ def internet_answer(question, language_instruction):
             role="user",
             parts=[types.Part(
                 text=f"""
-Answer this using general public knowledge.
+Answer using general public knowledge.
 
 IMPORTANT:
 - This is NOT official MIDC information
@@ -171,7 +216,7 @@ QUESTION:
         )]
     )
 
-    return response.text if response and response.text else None
+    return clean_llm_html(response.text) if response and response.text else None
 
 # =====================
 # CHAT ENDPOINT
@@ -195,10 +240,10 @@ def chat():
         else "Respond in English."
     )
 
-    # 🔒 MIDC ENTITY OVERRIDE
+    # 🔒 MIDC ENTITY ALWAYS OVERRIDES INTERNET
     force_midc = is_midc_entity_query(question)
 
-    # 🌐 INTERNET MODE (EXPLICIT ONLY)
+    # 🌐 INTERNET MODE (ONLY IF EXPLICIT)
     if not force_midc and is_explicit_internet_query(question, mode):
         answer = internet_answer(question, language_instruction)
 
@@ -214,7 +259,7 @@ def chat():
             }
         })
 
-    # 🏛 MIDC MODE
+    # 🏛 MIDC MODE (PRIMARY)
     pages, pdfs, forms, external_links = load_all_content()
     context = build_context(pages, pdfs, question)
 
@@ -245,21 +290,24 @@ MANDATORY RULES:
         contents=[types.Content(role="user", parts=[types.Part(text=prompt)])]
     )
 
-    answer = response.text.strip() if response and response.text else (
-        "<strong>Information not available on the MIDC website.</strong>"
+    answer = clean_llm_html(
+        response.text.strip()
+        if response and response.text
+        else "<strong>Information not available on the MIDC website.</strong>"
     )
 
     return jsonify({
         "answer": answer,
         "confidence_score": 0.82,
-        "recommended_pages": [
+        "recommended_pages": recommend_pages(question, pages),
+        "external_links": [
             {
-                "title": p.get("section", "MIDC Page").replace("-", " ").title(),
-                "url": p.get("source_url")
+                "title": l.get("title", "External Link"),
+                "url": l.get("url")
             }
-            for p in pages[:3] if p.get("source_url")
-        ],
-        "external_links": external_links[:5],
+            for l in external_links
+            if l.get("url")
+        ][:5],
         "forms_detected": forms[:2],
         "conversation_state": {
             "intent": "midc",
